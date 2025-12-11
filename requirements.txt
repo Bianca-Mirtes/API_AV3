@@ -1,0 +1,10 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+pydantic==2.5.0
+torch==2.7.1
+transformers==4.36.0
+openai-whisper==20231117  # Whisper oficial da OpenAI
+requests==2.31.0
+python-multipart==0.0.6
+numpy==1.24.3
+soundfile==0.12.1  # Para processar áudio
