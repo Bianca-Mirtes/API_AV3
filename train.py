@@ -18,56 +18,61 @@ LEARNING_RATE = 1e-3
 OBJ_TYPES = sorted([ "toilet", "sink", "shower", "fridge", "oven", "sink_kitchen", "table", "bed", "wardrobe", "nightstand", "sofa", "tv", "coffee_table" ]) 
 OBJ_TO_IDX = {o: i for i, o in enumerate(OBJ_TYPES)} 
 NUM_OBJ_TYPES = len(OBJ_TYPES) 
-INPUT_SIZE = 2 + MAX_OBJECTS * (NUM_OBJ_TYPES + 2) 
-OUTPUT_SIZE = MAX_OBJECTS * 4 
-# ========================= # ENCODING DA CENA # ========================= 
-def encode_scene(scene): 
-    """
-    Entrada:
-      - room width, depth
-      - para cada objeto:
-          one-hot(type) + width + depth
 
-    Saída:
-      - para cada objeto:
-          x_norm, z_norm, sin(theta), cos(theta)
-    """
-    room_w, room_d = scene["room"] 
-    x = [room_w, room_d] 
+# === INPUT ===
+# room_w, room_d → 2 valores
+# por objeto → onehot(13) + w + d + h → 16 valores
+INPUT_PER_OBJECT = NUM_OBJ_TYPES + 3
+INPUT_SIZE = 3 + MAX_OBJECTS * INPUT_PER_OBJECT
+
+# === OUTPUT ===
+# para cada objeto → x, y, z, sin(rot), cos(rot) = 5 valores
+OUTPUT_PER_OBJECT = 5
+OUTPUT_SIZE = MAX_OBJECTS * OUTPUT_PER_OBJECT
+
+# ========================= # ENCODING DA CENA # ========================= 
+def encode_scene(scene):
+    room_w, room_h, room_d = scene["room"]
+
+    # Agora 3 valores da sala
+    x = [room_w, room_h, room_d]
 
     objects = scene["objects"][:MAX_OBJECTS]
 
-    # input
-    for obj in objects: 
-        onehot = [0.0] * NUM_OBJ_TYPES 
+    # INPUT — exatamente 16 por objeto
+    for obj in objects:
+        onehot = [0.0] * NUM_OBJ_TYPES
         onehot[OBJ_TO_IDX[obj["type"]]] = 1.0
 
-        x.extend(onehot) 
-        x.extend([obj["w"], obj["d"]]) 
+        w = obj.get("w", 0.0)
+        d = obj.get("d", 0.0)
+        h = obj.get("h", 0.0)
 
-    # padding    
-    while len(objects) < MAX_OBJECTS: 
-        x.extend([0.0] * NUM_OBJ_TYPES) 
-        x.extend([0.0, 0.0]) 
-        objects.append(None) 
+        x.extend(onehot)
+        x.extend([w, d, h])
 
-    # TARGET 
-    y = [] 
-    for obj in scene["objects"][:MAX_OBJECTS]: 
-        y.extend([ 
-            obj["x"] / room_w, 
-            obj["z"] / room_d, 
-            math.sin(math.radians(obj["rot"])), 
-            math.cos(math.radians(obj["rot"])) 
-            ]) 
+    # PADDING — garante 16 * MAX_OBJECTS
+    for _ in range(MAX_OBJECTS - len(objects)):
+        x.extend([0.0] * NUM_OBJ_TYPES)
+        x.extend([0.0, 0.0, 0.0])
 
+    # TARGET (sempre 5 * MAX_OBJECTS)
+    y = []
+    for obj in objects:
+        x_norm = obj["x"] / room_w
+        y_norm = obj["y"] / room_h
+        z_norm = obj["z"] / room_d
+        r = math.radians(obj["rot"])
+        y.extend([x_norm, y_norm, z_norm, math.sin(r), math.cos(r)])
+
+    # Padding para targets faltantes
     while len(y) < OUTPUT_SIZE:
-        y.extend([0.0, 0.0, 0.0, 0.0]) 
-    
-    return ( 
-        torch.tensor(x, dtype=torch.float32), 
-        torch.tensor(y, dtype=torch.float32) 
-    ) 
+        y.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+
+    return (
+        torch.tensor(x, dtype=torch.float32),
+        torch.tensor(y, dtype=torch.float32),
+    )
         
 # ========================= # DATASET PYTORCH # ========================= 
 class LayoutDataset(Dataset): 
@@ -87,22 +92,24 @@ class LayoutMLP(nn.Module):
         super().__init__() 
         self.net = nn.Sequential(
             nn.Linear(INPUT_SIZE, 512), 
-            nn.ReLU(), nn.Linear(512, 512), 
-            nn.ReLU(), nn.Linear(512, 256), 
-            nn.ReLU(), nn.Linear(256, OUTPUT_SIZE) 
+            nn.ReLU(), 
+            nn.Linear(512, 512), 
+            nn.ReLU(), 
+            nn.Linear(512, 256), 
+            nn.ReLU(), 
+            nn.Linear(256, OUTPUT_SIZE) 
         ) 
     def forward(self, x): 
         return self.net(x)
                 
-def collision_loss(pred, sizes, n_objs):
+def collision_loss(pred, sizes):
     loss = 0.0
-    for i in range(n_objs):
-        for j in range(i + 1, n_objs):
-            bi = i * 4
-            bj = j * 4
 
-            dx = torch.abs(pred[bi] - pred[bj])
-            dz = torch.abs(pred[bi + 1] - pred[bj + 1])
+    for i in range(MAX_OBJECTS):
+        for j in range(i + 1, MAX_OBJECTS):
+            # x/z normalizados → desnormalizar
+            dx = torch.abs(pred[i, 0] - pred[j, 0])
+            dz = torch.abs(pred[i, 2] - pred[j, 2])
 
             min_x = (sizes[i][0] + sizes[j][0]) / 2
             min_z = (sizes[i][1] + sizes[j][1]) / 2
@@ -111,17 +118,21 @@ def collision_loss(pred, sizes, n_objs):
             overlap_z = torch.relu(min_z - dz)
 
             loss += overlap_x * overlap_z
+
     return loss
 
-def spread_loss(pred, n): 
-    loss = 0 
-    for i in range(n): 
-        for j in range(i+1, n): 
-            dx = pred[i*3] - pred[j*3] 
-            dz = pred[i*3+1] - pred[j*3+1] 
-            dist = torch.sqrt(dx*dx + dz*dz + 1e-6) 
-            loss += torch.relu(0.5 - dist) 
-    return loss 
+# =========================
+# Loss de espalhamento
+# =========================
+def spread_loss(pred):
+    loss = 0.0
+    for i in range(MAX_OBJECTS):
+        for j in range(i + 1, MAX_OBJECTS):
+            dx = pred[i, 0] - pred[j, 0]
+            dz = pred[i, 2] - pred[j, 2]
+            dist = torch.sqrt(dx * dx + dz * dz + 1e-6)
+            loss += torch.relu(0.5 - dist)
+    return loss
 
 # ========================= 
 # TREINAMENTO 
@@ -146,17 +157,18 @@ def train():
 
             # tamanhos dos objetos
             sizes = []
-            n_objs = MAX_OBJECTS
             idx = 2
             for _ in range(MAX_OBJECTS):
                 idx += NUM_OBJ_TYPES
                 w = x[0, idx]
                 d = x[0, idx + 1]
                 sizes.append((w, d))
-                idx += 2
+                idx += 3
 
-            col_loss = collision_loss(pred[0], sizes, n_objs)
-            spr_loss = spread_loss(pred[0], n_objs)
+            pred_first = pred[0].reshape(MAX_OBJECTS, OUTPUT_PER_OBJECT)
+
+            col_loss = collision_loss(pred_first, sizes)
+            spr_loss = spread_loss(pred_first)
 
             loss = pos_loss + 5.0 * col_loss + 0.5 * spr_loss
 
@@ -173,4 +185,5 @@ def train():
 # =========================
 # EXECUÇÃO 
 # =========================
-if __name__ == "__main__": train()
+if __name__ == "__main__": 
+    train()

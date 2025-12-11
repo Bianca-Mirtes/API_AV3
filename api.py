@@ -29,8 +29,14 @@ OBJ_TYPES = sorted([
 OBJ_TO_IDX = {o: i for i, o in enumerate(OBJ_TYPES)}
 NUM_OBJ_TYPES = len(OBJ_TYPES)
 
-INPUT_SIZE = 2 + MAX_OBJECTS * (NUM_OBJ_TYPES + 2)
-OUTPUT_SIZE = MAX_OBJECTS * 4
+# === INPUT ===
+# room_w, room_d → 2 valores
+# por objeto → onehot(13) + w + d + h → 16 valores
+INPUT_PER_OBJECT = NUM_OBJ_TYPES + 3
+OUTPUT_PER_OBJECT = 5
+
+INPUT_SIZE = 3 + MAX_OBJECTS * INPUT_PER_OBJECT
+OUTPUT_SIZE = MAX_OBJECTS * OUTPUT_PER_OBJECT
 
 # =========================
 # MODELO
@@ -65,13 +71,12 @@ app = FastAPI(title="Layout 3D Predictor")
 # =========================
 # MODELOS DE ENTRADA
 # =========================
-
 class ObjectInput(BaseModel):
     type: str
-    size: List[float]  # [width, depth]
+    size: List[float]  # [width, height, depth]
 
 class LayoutRequest(BaseModel):
-    room: List[float]  # [width, depth]
+    room: List[float]  # [width, height, depth]
     objects: List[ObjectInput]
 
 # =========================
@@ -79,8 +84,8 @@ class LayoutRequest(BaseModel):
 # =========================
 
 def preprocess(req: LayoutRequest):
-    room_w, room_d = req.room
-    x = [room_w, room_d]
+    room_w, room_h, room_d = req.room
+    x = [room_w, room_h, room_d]
 
     objs = req.objects[:MAX_OBJECTS]
 
@@ -89,37 +94,43 @@ def preprocess(req: LayoutRequest):
         if obj.type in OBJ_TO_IDX:
             onehot[OBJ_TO_IDX[obj.type]] = 1.0
 
-        x.extend(onehot)
-        x.extend([obj.size[0], obj.size[1]])
+        w = obj.size[0]
+        d = obj.size[1]   # <-- CORRETO
+        h = obj.size[2]   # <-- CORRETO
 
-    while len(objs) < MAX_OBJECTS:
+        x.extend(onehot)
+        x.extend([w, d, h])
+
+    for _ in range(MAX_OBJECTS - len(objs)):
         x.extend([0.0] * NUM_OBJ_TYPES)
-        x.extend([0.0, 0.0])
-        objs.append(None)
+        x.extend([0.0, 0.0, 0.0])
 
     return torch.tensor(x, dtype=torch.float32).unsqueeze(0)
-
 # =========================
 # PÓS-PROCESSAMENTO
 # =========================
-
-def postprocess(pred, room_w, room_d, n_objects):
+def postprocess(pred, room_w, room_h, room_d, n_objects):
     pred = pred.squeeze(0).cpu().numpy()
     results = []
 
     for i in range(n_objects):
-        base = i * 4
-        x_norm = pred[base]
-        z_norm = pred[base + 1]
-        sin_t = pred[base + 2]
-        cos_t = pred[base + 3]
+        base = i * OUTPUT_PER_OBJECT
+
+        x_norm  = pred[base + 0]
+        y_norm  = pred[base + 1]
+        z_norm  = pred[base + 2]
+        sin_t   = pred[base + 3]
+        cos_t   = pred[base + 4]
 
         x = float(x_norm * room_w)
+        y = float(y_norm * room_h)
         z = float(z_norm * room_d)
+
         angle = math.degrees(math.atan2(sin_t, cos_t))
 
         results.append({
             "x": x,
+            "y": y,
             "z": z,
             "rotation": angle
         })
@@ -132,7 +143,7 @@ def postprocess(pred, room_w, room_d, n_objects):
 
 @app.post("/predict_layout")
 def predict_layout(req: LayoutRequest):
-    room_w, room_d = req.room
+    room_w,  room_h, room_d = req.room
     x = preprocess(req).to(DEVICE)
 
     with torch.no_grad():
@@ -141,6 +152,7 @@ def predict_layout(req: LayoutRequest):
     return postprocess(
         pred,
         room_w,
+        room_h,
         room_d,
         n_objects=len(req.objects)
     )
